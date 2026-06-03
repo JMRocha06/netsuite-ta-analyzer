@@ -422,13 +422,53 @@ function parseTA(wb,filename){
   s.recommendedTierIdx=(s.tierWarningLevel==='critical'&&tIdx<TIERS.length-1)?tIdx+1:tIdx;
   s.tier=TIERS[s.recommendedTierIdx];s.baseTier=baseTier;s.pctOfMax=pctOfMax;
   const rt=s.rtCount;
-  const baseConc=s.tier.conc[0]; // base concurrency without SCP
-  let scp=0;
-  if(rt===0){scp=0;}
-  else if(rt<baseConc*0.5){scp=0;} // RT well below base limit, no SCP needed
-  else if(rt<baseConc){scp=1;}    // RT approaching base limit, 1 SCP
-  else if(rt<s.tier.conc[1]||!s.tier.conc[1]){scp=1;} // RT at or above base, 1 SCP
-  else{scp=Math.min(Math.ceil(rt/baseConc),s.tier.scpMax);} // RT well above, scale up
+  const batch=s.batchCount;
+  const baseConc=s.tier.conc[0];
+
+  // --- VECTOR 1: Integration Concurrency (RT × 2) ---
+  const requiredConc=rt*2;
+  s.requiredConc=requiredConc;
+  let scpByRT=0;
+  if(rt===0){
+    scpByRT=0;
+  } else if(requiredConc<=baseConc){
+    scpByRT=0;
+  } else {
+    const concMap=s.tier.conc;
+    for(let i=0;i<=s.tier.scpMax;i++){
+      if(concMap[i]&&concMap[i]>=requiredConc){scpByRT=i;break;}
+      if(i===s.tier.scpMax) scpByRT=s.tier.scpMax;
+    }
+  }
+
+  // --- VECTOR 2: CSV Import Queues/Threads (Batch) ---
+  // 0 SCP = 1 queue / 1 thread (sequential, 1 batch at a time)
+  // 1 SCP = 5 queues / 2 threads
+  // 2 SCP = 5 queues / 5 threads
+  // 3+ SCP = 5 queues / 10 threads
+  // Rule: if batch>0 need at least 1 SCP to get parallel queues
+  //       if batch>5 need 2 SCP for more threads
+  //       if batch>10 need 3 SCP for max threads
+  let scpByBatch=0;
+  if(batch===0){
+    scpByBatch=0;
+  } else if(batch<=2){
+    scpByBatch=0; // 1-2 batch imports: base 1/1 queue is manageable
+  } else if(batch<=5){
+    scpByBatch=1; // 3-5 batch: need parallel queues (5/2)
+  } else if(batch<=10){
+    scpByBatch=2; // 6-10 batch: need more threads (5/5)
+  } else {
+    scpByBatch=3; // 11+ batch: max threads (5/10)
+  }
+  // Standard can only have 1 SCP max
+  scpByBatch=s.tier.name==='Standard'?Math.min(scpByBatch,1):scpByBatch;
+
+  // --- FINAL: take the highest of the two vectors ---
+  s.scpByRT=scpByRT;
+  s.scpByBatch=scpByBatch;
+  s.scpDeterminant=scpByRT>=scpByBatch?'RT':'Batch';
+  let scp=Math.max(scpByRT,scpByBatch);
   if(s.tier.name==='Standard') scp=Math.min(scp,1);
   s.suggestedSCP=Math.min(scp,s.tier.scpMax);
   s.hasAvgCosting=String(s.costing).toUpperCase().includes('AVERAGE');
@@ -465,7 +505,11 @@ function render(){
   let iHtml=!s.hasIntegrations?'<p class="muted" style="padding:.25rem 0">Sin integraciones reales capturadas.</p>':
     '<div class="grid-3" style="margin-bottom:.75rem"><div class="metric"><div class="metric-label">Total</div><div class="metric-value">'+s.integrations.length+'</div></div><div class="metric"><div class="metric-label">Tiempo Real</div><div class="metric-value" style="color:#c0392b">'+s.rtCount+'</div></div><div class="metric"><div class="metric-label">Batch</div><div class="metric-value">'+s.batchCount+'</div></div></div><div style="overflow-x:auto"><table><thead><tr><th>Aplicacion</th><th>Tipo</th><th>Conector</th><th>Tasa Pico</th></tr></thead><tbody>'+
     s.integrations.map(i=>{const rt=i.type.toLowerCase().includes('real')||i.type.toLowerCase().includes('tiempo');return'<tr><td>'+i.app+'</td><td><span class="pill '+(rt?'pill-rt':'pill-batch')+'">'+i.type+'</span></td><td style="color:#888">'+(i.connector||'--')+'</td><td style="color:#888">'+(i.peak||'--')+'</td></tr>';}).join('')+'</tbody></table></div>';
-  iHtml+='<hr class="divider"><div class="metric" style="margin-top:.75rem"><div class="metric-label">Sugerencia de SCP</div><div style="font-size:20px;font-weight:600;margin:.25rem 0">'+s.suggestedSCP+' SuiteCloud Plus</div><p class="muted" style="font-size:12px">Tier <b>'+t.name+'</b> + '+s.rtCount+' int. RT -> '+concSugg+' conexiones concurrentes. Maximo '+t.name+': '+t.scpMax+' SCP</p></div>';
+  const rtLine=s.rtCount>0?s.rtCount+' RT × 2 = '+s.requiredConc+' conex. requeridas → '+s.scpByRT+' SCP':'RT: Sin integraciones (0 SCP)';
+  const batchLine=s.batchCount>0?s.batchCount+' Batch → CSV Queues → '+s.scpByBatch+' SCP':'Batch: Sin integraciones (0 SCP)';
+  const determinantLine='Determinante: Vector <b>'+(s.scpDeterminant==='RT'?'Concurrencia RT':'CSV/Batch Queues')+'</b> → <b>'+s.suggestedSCP+' SCP</b> → '+concSugg+' conexiones concurrentes';
+  const baseLineLabel='Base '+t.name+' sin SCP: '+t.conc[0]+' conex. | Máx: '+t.scpMax+' SCP';
+  iHtml+='<hr class="divider"><div class="metric" style="margin-top:.75rem"><div class="metric-label">Sugerencia de SCP</div><div style="font-size:20px;font-weight:600;margin:.25rem 0">'+s.suggestedSCP+' SuiteCloud Plus</div><p class="muted" style="font-size:12px;line-height:1.8">'+rtLine+'<br>'+batchLine+'<br>'+determinantLine+'<br>'+baseLineLabel+'</p></div>';
   document.getElementById('integration-analysis').innerHTML=iHtml;
   document.getElementById('scp-input').value=s.suggestedSCP;
   document.getElementById('scp-input').max=s.tier.scpMax;
@@ -557,8 +601,8 @@ function buildPPT(){
       sl1Warns.push('Costing AVERAGE activo — genera transacciones ICR adicionales que incrementan el volumen real.');
     if(s.hasKits)
       sl1Warns.push('Kits/Ensambles activos — verificar que las lineas de kit explosion esten reflejadas en el TA.');
-    if(s.hasIntegrations&&s.rtCount>0&&scpN===0)
-      sl1Warns.push(s.rtCount+' integracion(es) RT con concurrencia base suficiente ('+t.conc[0]+' conexiones) — monitorear si crece el ecosistema.');
+    if(s.hasIntegrations&&(s.rtCount>0||s.batchCount>0)&&scpN===0)
+      sl1Warns.push('Vector RT: '+s.rtCount+' RT × 2 = '+s.requiredConc+' conex. | Vector Batch: '+s.batchCount+' batch → '+s.scpByBatch+' SCP. Concurrencia base '+t.name+' ('+t.conc[0]+') cubre ambos vectores — monitorear crecimiento.');
 
     if(sl1Warns.length>0){
       const warnRowH=0.27;
@@ -680,7 +724,12 @@ function buildPPT(){
          return tierDesc+warnDesc;
        })()},
       {t:'SuiteCloud Plus: '+(scpN>0?scpN+' licencia'+(scpN>1?'s':'')+' requerida'+(scpN>1?'s':''):'Sin licencia requerida'),
-       b:scpN>0?'Con '+s.integrations.length+' integracion(es) y tier '+t.name+', se necesitan '+scpN+' SCP para alcanzar '+concN+' conexiones concurrentes, cubriendo el requerimiento de '+s.rtCount+' integracion(es) RT.'+warnNoPeak:'La concurrencia base de '+t.name+' ('+t.conc[0]+' conexiones) es suficiente para cubrir '+s.rtCount+' integracion(es) RT.'+warnNoInt+warnNoPeak},
+       b:(()=>{
+         const rtExpl=s.rtCount+' RT × 2 = '+s.requiredConc+' conexiones requeridas (base '+t.name+': '+t.conc[0]+') → '+s.scpByRT+' SCP por concurrencia.';
+         const batchExpl=s.batchCount+' Batch → CSV Queues → '+s.scpByBatch+' SCP por procesamiento.';
+         const detExpl='Determinante: '+(s.scpDeterminant==='RT'?'Concurrencia RT':'CSV/Batch Queues')+' con '+scpN+' SCP → '+concN+' conexiones concurrentes.';
+         return rtExpl+' '+batchExpl+' '+detExpl+warnNoPeak+(scpN===0?warnNoInt:'');
+       })()},
       {t:'Modulo Critico: '+topMod.l+' ('+topModPct+'% del volumen)',
        b:topMod.l+' concentra '+fmt(topMod.v)+' lineas/mes ('+topModPct+'% del total), siendo el modulo de mayor volumen transaccional y riesgo operativo dentro de la instancia.'},
       {t:s.subsidiaries>1?'Complejidad Multisubsidiaria':'Complejidad Organizacional',
